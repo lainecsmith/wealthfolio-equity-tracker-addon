@@ -1,0 +1,47 @@
+{
+  "id": "equity-tracker",
+  "name": "Equity Tracker",
+  "version": "1.0.0",
+  "description": "Track ISOs, NSOs, and RSUs with vesting, exercise/vest recording, and tax estimates",
+  "author": "Wealthfolio Community",
+  "main": "dist/addon.js",
+  "sdkVersion": "3.8.0",
+  "minWealthfolioVersion": "3.8.0",
+  "enabled": true,
+  "contributes": {
+    "routes": [{ "id": "equity" }],
+    "links": {
+      "sidebar": [
+        {
+          "id": "equity",
+          "route": "equity",
+          "label": "Equity",
+          "icon": "certificate",
+          "order": 150
+        }
+      ]
+    }
+  },
+  "permissions": [
+    {
+      "category": "accounts",
+      "functions": ["getAll"],
+      "purpose": "Select account when recording vest or exercise"
+    },
+    {
+      "category": "activities",
+      "functions": ["create", "import"],
+      "purpose": "Create TRANSFER_IN for RSU vests and BUY for option exercises"
+    },
+    {
+      "category": "financialAssets",
+      "functions": ["getProfile", "updateProfile", "updateQuoteMode"],
+      "purpose": "Manage private company assets and manual 409A pricing"
+    },
+    {
+      "category": "quotes",
+      "functions": ["update"],
+      "purpose": "Update private company share price from 409A valuations"
+    }
+  ]
+}
