@@ -89,10 +89,11 @@ async function resolveSymbol(ctx, symbol) {
       (h) => (h.symbol || "").toUpperCase() === symbol.toUpperCase()
     );
     if (exact) {
+      const manual = (exact.quoteMode || "").toUpperCase() === "MANUAL";
       return {
         symbol: exact.symbol || symbol,
         currency: exact.currency || "USD",
-        listed: true,
+        listed: !manual,
         exchangeMic: exact.exchangeMic,
         existingAssetId: exact.existingAssetId,
         instrumentType: exact.instrumentType || exact.quoteType
@@ -155,42 +156,6 @@ function plainActivity(activity) {
   }
   return payload;
 }
-async function latestManualPrice(ctx, symbol) {
-  var _a;
-  const getHistory = (_a = ctx.api.quotes) == null ? void 0 : _a.getHistory;
-  if (!getHistory || !symbol) return void 0;
-  try {
-    const history = await getHistory(symbol);
-    const quotes = Array.isArray(history) ? history : [];
-    let best;
-    for (const quote of quotes) {
-      const close = Number((quote == null ? void 0 : quote.close) ?? (quote == null ? void 0 : quote.adjclose));
-      const time = String((quote == null ? void 0 : quote.timestamp) ?? "");
-      if (!Number.isFinite(close) || close <= 0) continue;
-      if (!best || time > best.time) best = { time, close };
-    }
-    return best == null ? void 0 : best.close;
-  } catch {
-    return void 0;
-  }
-}
-async function restoreManualPrice(ctx, assetId, price, currency) {
-  const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-  await ctx.api.quotes.update(assetId, {
-    id: "",
-    createdAt: timestamp,
-    dataSource: "MANUAL",
-    timestamp,
-    assetId,
-    open: price,
-    high: price,
-    low: price,
-    close: price,
-    adjclose: price,
-    volume: 0,
-    currency
-  });
-}
 async function createActivity(ctx, activity) {
   const payload = plainActivity(activity);
   try {
@@ -220,7 +185,6 @@ async function recordVestOrExercise(ctx, grant, quantity, date, accountId) {
     });
     return activity2.id;
   }
-  const savedPrice = listing.listed ? void 0 : await latestManualPrice(ctx, listing.symbol);
   const cost = quantity * strike;
   const activity = await createActivity(ctx, {
     accountId,
@@ -228,7 +192,9 @@ async function recordVestOrExercise(ctx, grant, quantity, date, accountId) {
     activityDate: date,
     asset,
     quantity,
-    unitPrice: strike,
+    // A listed buy prices the shares at the strike. A private buy must not
+    // send a price: Wealthfolio would replace the security's FMV with it.
+    ...listing.listed ? { unitPrice: strike } : {},
     amount: cost,
     currency
   });
@@ -245,14 +211,29 @@ async function recordVestOrExercise(ctx, grant, quantity, date, accountId) {
     } catch {
     }
   }
-  const assetId = (activity == null ? void 0 : activity.assetId) || listing.existingAssetId || listing.symbol;
-  if (!listing.listed && savedPrice !== void 0 && savedPrice !== strike && assetId) {
-    try {
-      await restoreManualPrice(ctx, assetId, savedPrice, currency);
-    } catch {
-    }
-  }
   return activity.id;
+}
+async function createPrivateSecurity(ctx, companyName, fmv, accountId, date) {
+  const symbol = privateSymbol(companyName);
+  if (!accountId) throw new Error("Choose an account for the private company");
+  if (!fmv || fmv <= 0) throw new Error("FMV must be positive");
+  await createActivity(ctx, {
+    accountId,
+    activityType: "BUY",
+    activityDate: date,
+    asset: {
+      symbol,
+      name: companyName,
+      kind: "OTHER",
+      quoteCcy: "USD",
+      quoteMode: "MANUAL"
+    },
+    quantity: 0,
+    unitPrice: fmv,
+    amount: 0,
+    currency: "USD"
+  });
+  return symbol;
 }
 function applyExercise(grant, quantity, date, activityId) {
   return {
@@ -325,6 +306,8 @@ function EquityPage() {
   const [grantDate, setGrantDate] = useState((/* @__PURE__ */ new Date()).toISOString().slice(0, 10));
   const [totalQuantity, setTotalQuantity] = useState("");
   const [strikePrice, setStrikePrice] = useState("");
+  const [fmv, setFmv] = useState("");
+  const [privateAccountId, setPrivateAccountId] = useState("");
   const [cliffMonths, setCliffMonths] = useState("12");
   const [cliffPercent, setCliffPercent] = useState("25");
   const [postCliffMonths, setPostCliffMonths] = useState("36");
@@ -332,14 +315,28 @@ function EquityPage() {
   const [vestQty, setVestQty] = useState("");
   const [vestDate, setVestDate] = useState((/* @__PURE__ */ new Date()).toISOString().slice(0, 10));
   const [accountId, setAccountId] = useState("");
-  const { data: grants = [], isLoading } = useQuery({
+  const grantsQuery = useQuery({
     queryKey: ["equity-grants"],
-    queryFn: () => loadGrants(ctx)
+    queryFn: async () => {
+      try {
+        return await loadGrants(ctx);
+      } catch (error) {
+        throw new Error(`storage.get failed: ${String(error)}`);
+      }
+    }
   });
-  const { data: accounts = [], refetch: refetchAccounts } = useQuery({
+  const grants = grantsQuery.data ?? [];
+  const accountsQuery = useQuery({
     queryKey: ["accounts"],
-    queryFn: () => ctx.api.accounts.getAll()
+    queryFn: async () => {
+      try {
+        return await ctx.api.accounts.getAll();
+      } catch (error) {
+        throw new Error(`accounts.getAll failed: ${String(error)}`);
+      }
+    }
   });
+  const accounts = accountsQuery.data ?? [];
   const addGrantMutation = useMutation({
     mutationFn: async () => {
       const qty = Number(totalQuantity);
@@ -347,18 +344,24 @@ function EquityPage() {
       const cliffM = Math.max(0, Number(cliffMonths) || 0);
       const cliffP = Math.max(0, Math.min(100, Number(cliffPercent) || 0));
       const postM = Math.max(0, Number(postCliffMonths) || 0);
+      const privateCompany = !symbol.trim();
+      const price = Number(fmv);
+      if (privateCompany && (!price || price <= 0)) throw new Error("Enter the current FMV");
+      if (privateCompany && !privateAccountId) throw new Error("Choose an account for the private company");
       const now = (/* @__PURE__ */ new Date()).toISOString();
+      const createdSymbol = privateCompany ? await createPrivateSecurity(ctx, companyName, price, privateAccountId, grantDate) : void 0;
       const grant = {
         id: newId(),
         type: grantType,
         companyName,
-        symbol: symbol.trim() || void 0,
+        symbol: symbol.trim() || createdSymbol,
         grantDate,
         totalQuantity: qty,
         strikePrice: grantType === "RSU" ? void 0 : Number(strikePrice) || void 0,
+        fmv: privateCompany ? price : void 0,
         vesting: generateVesting(qty, grantDate, cliffM, cliffP, postM),
-        accountId: "",
-        isPrivate: !symbol.trim(),
+        accountId: privateCompany ? privateAccountId : "",
+        isPrivate: privateCompany,
         createdAt: now,
         updatedAt: now
       };
@@ -370,6 +373,8 @@ function EquityPage() {
       setSymbol("");
       setTotalQuantity("");
       setStrikePrice("");
+      setFmv("");
+      setPrivateAccountId("");
       ctx.api.toast.success("Grant added");
     },
     onError: (e) => ctx.api.toast.error(String(e))
@@ -389,9 +394,11 @@ function EquityPage() {
     },
     onError: (e) => ctx.api.toast.error(String(e))
   });
-  if (isLoading) return /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "p-6", children: "Loading equity grants…" });
+  if (grantsQuery.isLoading) return /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "p-6", children: "Loading equity grants…" });
+  const loadError = grantsQuery.error ?? accountsQuery.error;
   return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "p-6 max-w-5xl mx-auto space-y-6", children: [
     /* @__PURE__ */ jsxRuntimeExports.jsx("h1", { className: "text-3xl font-bold", children: "Equity Tracker" }),
+    loadError && /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-sm text-destructive", children: String(loadError.message || loadError) }),
     /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-muted-foreground", children: "Add grants with a cliff and vesting schedule. Vested amounts are calculated automatically." }),
     /* @__PURE__ */ jsxRuntimeExports.jsxs(Card, { children: [
       /* @__PURE__ */ jsxRuntimeExports.jsx(CardHeader, { children: /* @__PURE__ */ jsxRuntimeExports.jsx(CardTitle, { children: "Add Grant" }) }),
@@ -478,9 +485,9 @@ function EquityPage() {
                 symbol.trim(),
                 "”. Clear this field to use the generated symbol instead."
               ] }) : companyName.trim() ? /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
-                "Symbol field is blank, so an exercise will create “",
+                "Symbol field is blank, so this grant will create “",
                 generated,
-                "” without searching."
+                "” at the FMV below."
               ] }) : /* @__PURE__ */ jsxRuntimeExports.jsx(jsxRuntimeExports.Fragment, { children: "Leave Symbol blank to generate one from the company name." }) });
             })()
           ] })
@@ -542,6 +549,39 @@ function EquityPage() {
               autoComplete: "off"
             }
           )
+        ] }),
+        !symbol.trim() && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "grid grid-cols-2 gap-3", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("label", { className: "text-sm", children: "Current FMV" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "input",
+              {
+                type: "number",
+                step: "0.01",
+                className: "w-full border rounded px-3 py-2",
+                value: fmv,
+                onChange: (e) => setFmv(e.target.value),
+                placeholder: "Share price",
+                autoComplete: "off"
+              }
+            )
+          ] }),
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("label", { className: "text-sm", children: "Account" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsxs(
+              "select",
+              {
+                className: "w-full border rounded px-3 py-2",
+                value: privateAccountId,
+                onChange: (e) => setPrivateAccountId(e.target.value),
+                children: [
+                  /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "", children: "Choose an account" }),
+                  accounts.map((a) => /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: a.id, children: a.name }, a.id))
+                ]
+              }
+            )
+          ] }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-xs text-muted-foreground col-span-2", children: "No ticker was chosen, so the add-on creates a private security priced at this FMV. Later exercises do not change that price." })
         ] }),
         /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "grid grid-cols-3 gap-3", children: [
           /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
@@ -616,7 +656,8 @@ function EquityPage() {
               " vested · ",
               exercised.toLocaleString(),
               " exercised",
-              g.strikePrice != null && ` · Strike $${g.strikePrice}`
+              g.strikePrice != null && ` · Strike $${g.strikePrice}`,
+              g.fmv != null && ` · FMV $${g.fmv}`
             ] })
           ] }),
           /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "space-x-2", children: [
@@ -692,7 +733,7 @@ function EquityPage() {
                 ]
               }
             ),
-            /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { type: "button", variant: "outline", size: "sm", onClick: () => refetchAccounts(), children: "Refresh" })
+            /* @__PURE__ */ jsxRuntimeExports.jsx(Button, { type: "button", variant: "outline", size: "sm", onClick: () => accountsQuery.refetch(), children: "Refresh" })
           ] })
         ] }),
         /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "space-x-2", children: [

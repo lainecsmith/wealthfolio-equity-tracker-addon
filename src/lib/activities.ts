@@ -34,13 +34,15 @@ async function resolveSymbol(ctx: AddonContext, symbol: string): Promise<Listing
           existingAssetId?: string;
           quoteType?: string;
           instrumentType?: string;
+          quoteMode?: string;
         }
       | undefined;
     if (exact) {
+      const manual = (exact.quoteMode || "").toUpperCase() === "MANUAL";
       return {
         symbol: exact.symbol || symbol,
         currency: exact.currency || "USD",
-        listed: true,
+        listed: !manual,
         exchangeMic: exact.exchangeMic,
         existingAssetId: exact.existingAssetId,
         instrumentType: exact.instrumentType || exact.quoteType,
@@ -108,48 +110,6 @@ function plainActivity(activity: Record<string, unknown>) {
   return payload;
 }
 
-async function latestManualPrice(ctx: AddonContext, symbol: string): Promise<number | undefined> {
-  const getHistory = ctx.api.quotes?.getHistory;
-  if (!getHistory || !symbol) return undefined;
-  try {
-    const history = await getHistory(symbol);
-    const quotes = Array.isArray(history) ? history : [];
-    let best: { time: string; close: number } | undefined;
-    for (const quote of quotes as Array<{ timestamp?: string; close?: number; adjclose?: number }>) {
-      const close = Number(quote?.close ?? quote?.adjclose);
-      const time = String(quote?.timestamp ?? "");
-      if (!Number.isFinite(close) || close <= 0) continue;
-      if (!best || time > best.time) best = { time, close };
-    }
-    return best?.close;
-  } catch {
-    return undefined;
-  }
-}
-
-async function restoreManualPrice(
-  ctx: AddonContext,
-  assetId: string,
-  price: number,
-  currency: string
-) {
-  const timestamp = new Date().toISOString();
-  await ctx.api.quotes.update(assetId, {
-    id: "",
-    createdAt: timestamp,
-    dataSource: "MANUAL",
-    timestamp,
-    assetId,
-    open: price,
-    high: price,
-    low: price,
-    close: price,
-    adjclose: price,
-    volume: 0,
-    currency,
-  } as never);
-}
-
 async function createActivity(ctx: AddonContext, activity: Record<string, unknown>) {
   const payload = plainActivity(activity);
   try {
@@ -191,8 +151,6 @@ export async function recordVestOrExercise(
     return activity.id;
   }
 
-  const savedPrice = listing.listed ? undefined : await latestManualPrice(ctx, listing.symbol);
-
   const cost = quantity * strike;
   const activity = await createActivity(ctx, {
     accountId,
@@ -200,7 +158,9 @@ export async function recordVestOrExercise(
     activityDate: date,
     asset,
     quantity,
-    unitPrice: strike,
+    // A listed buy prices the shares at the strike. A private buy must not
+    // send a price: Wealthfolio would replace the security's FMV with it.
+    ...(listing.listed ? { unitPrice: strike } : {}),
     amount: cost,
     currency,
     status: "POSTED",
@@ -223,16 +183,36 @@ export async function recordVestOrExercise(
     }
   }
 
-  // A private-company buy records the strike as that day's price. Put the
-  // previous price back so the security stays at its current FMV.
-  const assetId = activity?.assetId || listing.existingAssetId || listing.symbol;
-  if (!listing.listed && savedPrice !== undefined && savedPrice !== strike && assetId) {
-    try {
-      await restoreManualPrice(ctx, assetId, savedPrice, currency);
-    } catch {
-      // The shares are already recorded.
-    }
-  }
-
   return activity.id;
+}
+
+/** Creates the placeholder security and sets its price to the FMV. */
+export async function createPrivateSecurity(
+  ctx: AddonContext,
+  companyName: string,
+  fmv: number,
+  accountId: string,
+  date: string
+): Promise<string> {
+  const symbol = privateSymbol(companyName);
+  if (!accountId) throw new Error("Choose an account for the private company");
+  if (!fmv || fmv <= 0) throw new Error("FMV must be positive");
+  await createActivity(ctx, {
+    accountId,
+    activityType: "BUY",
+    activityDate: date,
+    asset: {
+      symbol,
+      name: companyName,
+      kind: "OTHER",
+      quoteCcy: "USD",
+      quoteMode: "MANUAL",
+    },
+    quantity: 0,
+    unitPrice: fmv,
+    amount: 0,
+    currency: "USD",
+    status: "POSTED",
+  });
+  return symbol;
 }

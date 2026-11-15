@@ -17,6 +17,8 @@ export interface EquityGrant {
   grantDate: string;
   totalQuantity: number;
   strikePrice?: number;
+  /** Current share price for a private company. Not used for a listed symbol. */
+  fmv?: number;
   expirationDate?: string;
   vesting: VestingTranche[];
   accountId: string;

@@ -4,7 +4,7 @@ import { Button, Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/u
 import { useState } from "react";
 import type { EquityGrant, GrantType } from "./types";
 import { loadGrants, upsertGrant, deleteGrant, vestedQuantity, exercisedQuantity } from "./storage";
-import { recordVestOrExercise, privateSymbol } from "./lib/activities";
+import { recordVestOrExercise, privateSymbol, createPrivateSecurity } from "./lib/activities";
 import { applyExercise } from "./lib/exercise";
 import { generateVesting, newId } from "./lib/vesting";
 
@@ -23,6 +23,8 @@ function EquityPage() {
   const [grantDate, setGrantDate] = useState(new Date().toISOString().slice(0, 10));
   const [totalQuantity, setTotalQuantity] = useState("");
   const [strikePrice, setStrikePrice] = useState("");
+  const [fmv, setFmv] = useState("");
+  const [privateAccountId, setPrivateAccountId] = useState("");
   const [cliffMonths, setCliffMonths] = useState("12");
   const [cliffPercent, setCliffPercent] = useState("25");
   const [postCliffMonths, setPostCliffMonths] = useState("36");
@@ -33,15 +35,29 @@ function EquityPage() {
   const [vestDate, setVestDate] = useState(new Date().toISOString().slice(0, 10));
   const [accountId, setAccountId] = useState("");
 
-  const { data: grants = [], isLoading } = useQuery({
+  const grantsQuery = useQuery({
     queryKey: ["equity-grants"],
-    queryFn: () => loadGrants(ctx),
+    queryFn: async () => {
+      try {
+        return await loadGrants(ctx);
+      } catch (error) {
+        throw new Error(`storage.get failed: ${String(error)}`);
+      }
+    },
   });
+  const grants = grantsQuery.data ?? [];
 
-  const { data: accounts = [], refetch: refetchAccounts } = useQuery({
+  const accountsQuery = useQuery({
     queryKey: ["accounts"],
-    queryFn: () => ctx.api.accounts.getAll(),
+    queryFn: async () => {
+      try {
+        return await ctx.api.accounts.getAll();
+      } catch (error) {
+        throw new Error(`accounts.getAll failed: ${String(error)}`);
+      }
+    },
   });
+  const accounts = accountsQuery.data ?? [];
 
   const addGrantMutation = useMutation({
     mutationFn: async () => {
@@ -51,19 +67,27 @@ function EquityPage() {
       const cliffM = Math.max(0, Number(cliffMonths) || 0);
       const cliffP = Math.max(0, Math.min(100, Number(cliffPercent) || 0));
       const postM = Math.max(0, Number(postCliffMonths) || 0);
+      const privateCompany = !symbol.trim();
+      const price = Number(fmv);
+      if (privateCompany && (!price || price <= 0)) throw new Error("Enter the current FMV");
+      if (privateCompany && !privateAccountId) throw new Error("Choose an account for the private company");
 
       const now = new Date().toISOString();
+      const createdSymbol = privateCompany
+        ? await createPrivateSecurity(ctx, companyName, price, privateAccountId, grantDate)
+        : undefined;
       const grant: EquityGrant = {
         id: newId(),
         type: grantType,
         companyName,
-        symbol: symbol.trim() || undefined,
+        symbol: symbol.trim() || createdSymbol,
         grantDate,
         totalQuantity: qty,
         strikePrice: grantType === "RSU" ? undefined : Number(strikePrice) || undefined,
+        fmv: privateCompany ? price : undefined,
         vesting: generateVesting(qty, grantDate, cliffM, cliffP, postM),
-        accountId: "",
-        isPrivate: !symbol.trim(),
+        accountId: privateCompany ? privateAccountId : "",
+        isPrivate: privateCompany,
         createdAt: now,
         updatedAt: now,
       };
@@ -75,6 +99,8 @@ function EquityPage() {
       setSymbol("");
       setTotalQuantity("");
       setStrikePrice("");
+      setFmv("");
+      setPrivateAccountId("");
       ctx.api.toast.success("Grant added");
     },
     onError: (e) => ctx.api.toast.error(String(e)),
@@ -96,11 +122,16 @@ function EquityPage() {
     onError: (e) => ctx.api.toast.error(String(e)),
   });
 
-  if (isLoading) return <div className="p-6">Loading equity grants…</div>;
+  if (grantsQuery.isLoading) return <div className="p-6">Loading equity grants…</div>;
+
+  const loadError = grantsQuery.error ?? accountsQuery.error;
 
   return (
     <div className="p-6 max-w-5xl mx-auto space-y-6">
       <h1 className="text-3xl font-bold">Equity Tracker</h1>
+      {loadError && (
+        <p className="text-sm text-destructive">{String(loadError.message || loadError)}</p>
+      )}
       <p className="text-muted-foreground">
         Add grants with a cliff and vesting schedule. Vested amounts are calculated automatically.
       </p>
@@ -180,7 +211,7 @@ function EquityPage() {
                     {symbol.trim()
                       ? <>Will search for “{symbol.trim()}”. Clear this field to use the generated symbol instead.</>
                       : companyName.trim()
-                        ? <>Symbol field is blank, so an exercise will create “{generated}” without searching.</>
+                        ? <>Symbol field is blank, so this grant will create “{generated}” at the FMV below.</>
                         : <>Leave Symbol blank to generate one from the company name.</>}
                   </p>
                 );
@@ -234,6 +265,41 @@ function EquityPage() {
                 placeholder="Exercise price"
                 autoComplete="off"
               />
+            </div>
+          )}
+
+          {!symbol.trim() && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-sm">Current FMV</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  className="w-full border rounded px-3 py-2"
+                  value={fmv}
+                  onChange={(e) => setFmv(e.target.value)}
+                  placeholder="Share price"
+                  autoComplete="off"
+                />
+              </div>
+              <div>
+                <label className="text-sm">Account</label>
+                <select
+                  className="w-full border rounded px-3 py-2"
+                  value={privateAccountId}
+                  onChange={(e) => setPrivateAccountId(e.target.value)}
+                >
+                  <option value="">Choose an account</option>
+                  {accounts.map((a: { id: string; name: string }) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <p className="text-xs text-muted-foreground col-span-2">
+                No ticker was chosen, so the add-on creates a private security priced at this FMV. Later exercises do not change that price.
+              </p>
             </div>
           )}
 
@@ -297,6 +363,7 @@ function EquityPage() {
                     Grant {g.grantDate} · {g.totalQuantity.toLocaleString()} total ·{" "}
                     {vested.toLocaleString()} vested · {exercised.toLocaleString()} exercised
                     {g.strikePrice != null && ` · Strike $${g.strikePrice}`}
+                    {g.fmv != null && ` · FMV $${g.fmv}`}
                   </div>
                 </div>
                 <div className="space-x-2">
@@ -370,7 +437,7 @@ function EquityPage() {
                     </option>
                   ))}
                 </select>
-                <Button type="button" variant="outline" size="sm" onClick={() => refetchAccounts()}>
+                <Button type="button" variant="outline" size="sm" onClick={() => accountsQuery.refetch()}>
                   Refresh
                 </Button>
               </div>
