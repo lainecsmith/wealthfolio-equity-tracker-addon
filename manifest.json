@@ -1,0 +1,52 @@
+{
+  "id": "equity-tracker",
+  "name": "Equity Tracker",
+  "version": "1.0.0",
+  "description": "Track ISOs, NSOs, and RSUs with vesting and exercise/vest recording into Wealthfolio activities",
+  "author": "Wealthfolio Community",
+  "main": "dist/addon.js",
+  "sdkVersion": "3.8.0",
+  "minWealthfolioVersion": "3.8.0",
+  "enabled": true,
+  "contributes": {
+    "routes": [{ "id": "equity" }],
+    "links": {
+      "sidebar": [
+        {
+          "id": "equity",
+          "route": "equity",
+          "label": "Equity",
+          "icon": "certificate",
+          "order": 150
+        }
+      ]
+    }
+  },
+  "permissions": [
+    {
+      "category": "accounts",
+      "functions": ["getAll"],
+      "purpose": "List accounts so an exercise or vest can be recorded in the right one"
+    },
+    {
+      "category": "market-data",
+      "functions": ["searchTicker"],
+      "purpose": "Suggest ticker symbols from company name and look up assets before recording activities"
+    },
+    {
+      "category": "activities",
+      "functions": ["create", "import"],
+      "purpose": "Create TRANSFER_IN for RSU vests and BUY for option exercises"
+    },
+    {
+      "category": "assets",
+      "functions": ["getProfile", "updateProfile", "updateQuoteMode"],
+      "purpose": "Read and update asset profiles so quote currency is set before recording activities"
+    },
+    {
+      "category": "quotes",
+      "functions": ["update", "getHistory"],
+      "purpose": "Update private company share price from valuations, read the current private-company price and put it back after an exercise"
+    }
+  ]
+}
